@@ -279,7 +279,6 @@ static bool set_standby(standby_t x) {
     return write_bytes(msg, sizeof(msg));
 }
 
-
 static bool set_packet_type(modem_t x) {
     uint8_t msg[] = { 0x8A, x };
 
@@ -288,6 +287,12 @@ static bool set_packet_type(modem_t x) {
 
 static bool calibrate(uint8_t x) {
     uint8_t msg[] = { 0x89, x };
+
+    return write_bytes(msg, sizeof(msg));
+}
+
+static bool regulator(uint8_t x) {
+    uint8_t msg[] = { 0x96, x };
 
     return write_bytes(msg, sizeof(msg));
 }
@@ -717,8 +722,14 @@ void sx126x_set_freq(uint64_t x) {
 }
 
 void sx126x_set_tx_power(uint8_t db) {
-    if (db > 22) {
-        db = 22;
+    /* Tuned for E22-...M30S */
+
+    if (db > 30) {
+        db = 30;
+    }
+
+    if (db < 8) {
+        db = 8;
     }
 
     uint8_t pa_config[] = { 0x95, 0x04, 0x07, 0x00, 0x01 };
@@ -726,12 +737,14 @@ void sx126x_set_tx_power(uint8_t db) {
     wait_on_busy();
     write_bytes(pa_config, sizeof(pa_config));
 
-    uint8_t ocp_param[] = { 0x18 };
+    uint8_t ocp_param[] = { db > 22 ? 0x38 : 0x18 };
 
     wait_on_busy();
     write_reg(REG_OCP_CONFIGURATION, ocp_param, sizeof(ocp_param));
 
-    uint8_t tx_params[] = { 0x8E, db, PA_RAMP_40U };
+    regulator(db > 22 ? 0x01 : 0x11);
+
+    int8_t tx_params[] = { 0x8E, db - 17, PA_RAMP_200U };
 
     wait_on_busy();
     write_bytes(tx_params, sizeof(tx_params));
