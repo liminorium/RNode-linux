@@ -12,6 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <syslog.h>
+#include <time.h>
 
 #include "rnode.h"
 #include "kiss.h"
@@ -52,6 +53,8 @@
 #define CMD_STAT_TEMP       0x29
 #define CMD_BLINK           0x30
 #define CMD_RANDOM          0x40
+#define CMD_RSSI_OFFSET     0x4A
+#define CMD_PREAMBLE        0x4B
 
 #define CMD_FB_EXT          0x41
 #define CMD_FB_READ         0x42
@@ -131,6 +134,17 @@ static bw_t     current_bw;
 static cr_t     current_cr;
 static uint8_t  current_tx_power;
 static uint8_t  current_sf;
+static int8_t   rssi_offset = 0;
+static uint16_t preamble_length = 18;
+static bool     header_implicit = false;
+
+// Airtime lock variables
+static uint16_t st_airtime_limit = 0;  // milliseconds per 20 seconds
+static uint16_t lt_airtime_limit = 0;  // milliseconds per hour
+static uint32_t st_airtime_used = 0;
+static uint32_t lt_airtime_used = 0;
+static time_t   st_window_start = 0;
+static time_t   lt_window_start = 0;
 
 /* * */
 
@@ -269,17 +283,136 @@ static void ans_radio_state(const uint8_t *param) {
     kiss_encode(ans, sizeof(ans));
 }
 
+static void ans_rssi_offset(const uint8_t *param) {
+    if (param[0] != 0) {
+        rssi_offset = (int8_t)param[0];
+        syslog(LOG_INFO, "RSSI offset set to %d", rssi_offset);
+    }
+
+    uint8_t ans[] = { CMD_RSSI_OFFSET, (uint8_t)rssi_offset };
+
+    kiss_encode(ans, sizeof(ans));
+}
+
+static void ans_preamble(const uint8_t *param) {
+    uint16_t preamble = (param[0] << 8) | param[1];
+
+    if (preamble != 0) {
+        preamble_length = preamble;
+        syslog(LOG_INFO, "Preamble length set to %d", preamble_length);
+    }
+
+    uint8_t ans[] = { CMD_PREAMBLE, preamble_length >> 8, preamble_length & 0xFF };
+
+    kiss_encode(ans, sizeof(ans));
+}
+
+static void ans_implicit(const uint8_t *param) {
+    header_implicit = param[0] ? true : false;
+    syslog(LOG_INFO, "Header mode set to %s", header_implicit ? "implicit" : "explicit");
+
+    uint8_t ans[] = { CMD_IMPLICIT, header_implicit ? 0x01 : 0x00 };
+
+    kiss_encode(ans, sizeof(ans));
+}
+
+static void ans_st_alock(const uint8_t *param) {
+    st_airtime_limit = (param[0] << 8) | param[1];
+    
+    uint8_t ans[] = { CMD_ST_ALOCK, param[0], param[1] };
+    kiss_encode(ans, sizeof(ans));
+    
+    syslog(LOG_INFO, "Short-term airtime lock set to %u ms per 20s", st_airtime_limit);
+}
+
+static void ans_lt_alock(const uint8_t *param) {
+    lt_airtime_limit = (param[0] << 8) | param[1];
+    
+    uint8_t ans[] = { CMD_LT_ALOCK, param[0], param[1] };
+    kiss_encode(ans, sizeof(ans));
+    
+    syslog(LOG_INFO, "Long-term airtime lock set to %u ms per hour", lt_airtime_limit);
+}
+
+/* * */
+
+// Check if airtime locks allow transmission
+bool rnode_check_airtime_lock(uint32_t packet_airtime) {
+    // If no limits are set, allow transmission
+    if (st_airtime_limit == 0 && lt_airtime_limit == 0) {
+        return true;
+    }
+    
+    time_t now = time(NULL);
+    
+    // Check short-term lock (20 second window)
+    if (st_airtime_limit > 0) {
+        // Initialize window start if not set
+        if (st_window_start == 0) {
+            st_window_start = now;
+        }
+        
+        // Reset window if 20 seconds have passed
+        if (now - st_window_start >= 20) {
+            st_airtime_used = 0;
+            st_window_start = now;
+        }
+        
+        // Check if transmission would exceed limit
+        if (st_airtime_used + packet_airtime > st_airtime_limit) {
+            syslog(LOG_WARNING, "Short-term airtime lock: would exceed limit (%u + %u > %u ms/20s)",
+                   st_airtime_used, packet_airtime, st_airtime_limit);
+            return false;
+        }
+    }
+    
+    // Check long-term lock (1 hour window)
+    if (lt_airtime_limit > 0) {
+        // Initialize window start if not set
+        if (lt_window_start == 0) {
+            lt_window_start = now;
+        }
+        
+        // Reset window if 1 hour has passed
+        if (now - lt_window_start >= 3600) {
+            lt_airtime_used = 0;
+            lt_window_start = now;
+        }
+        
+        // Check if transmission would exceed limit
+        if (lt_airtime_used + packet_airtime > lt_airtime_limit) {
+            syslog(LOG_WARNING, "Long-term airtime lock: would exceed limit (%u + %u > %u ms/hour)",
+                   lt_airtime_used, packet_airtime, lt_airtime_limit);
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+// Update airtime usage after successful transmission
+void rnode_update_airtime_usage(uint32_t packet_airtime) {
+    if (st_airtime_limit > 0) {
+        st_airtime_used += packet_airtime;
+        syslog(LOG_DEBUG, "ST airtime used: %u / %u ms (20s window)", st_airtime_used, st_airtime_limit);
+    }
+    
+    if (lt_airtime_limit > 0) {
+        lt_airtime_used += packet_airtime;
+        syslog(LOG_DEBUG, "LT airtime used: %u / %u ms (1h window)", lt_airtime_used, lt_airtime_limit);
+    }
+}
+
 /* * */
 
 void rnode_start() {
     sx126x_begin();
 
-    sx126x_set_dio3_txco_ctrl(DIO3_OUTPUT_1_8, TXCO_DELAY_10);
     sx126x_set_freq(current_freq);
     sx126x_set_tx_power(current_tx_power);
 
     sx126x_set_lora_modulation(current_sf, current_bw, current_cr, LDRO_OFF);
-    sx126x_set_lora_packet(HEADER_EXPLICIT, 18, 15, CRC_ON);
+    sx126x_set_lora_packet(header_implicit ? HEADER_IMPLICIT : HEADER_EXPLICIT, preamble_length, 15, CRC_ON);
     sx126x_set_sync_word(0x1424);
 
     sx126x_request(RX_CONTINUOUS);
@@ -339,6 +472,26 @@ void rnode_from_channel(const uint8_t *buf, size_t len) {
             ans_radio_state(buf);
             break;
 
+        case CMD_RSSI_OFFSET:
+            ans_rssi_offset(buf);
+            break;
+
+        case CMD_PREAMBLE:
+            ans_preamble(buf);
+            break;
+
+        case CMD_IMPLICIT:
+            ans_implicit(buf);
+            break;
+
+        case CMD_ST_ALOCK:
+            ans_st_alock(buf);
+            break;
+
+        case CMD_LT_ALOCK:
+            ans_lt_alock(buf);
+            break;
+
         case CMD_DATA:
             queue_push(buf, len);
             break;
@@ -353,7 +506,11 @@ void rnode_from_channel(const uint8_t *buf, size_t len) {
 }
 
 void rnode_signal_stat(uint8_t rssi, int8_t snr, uint8_t signal_rssi) {
-    uint8_t ans_rssi[] = { CMD_STAT_RSSI, 157 - rssi};
+    // Apply RSSI offset calibration
+    rssi = rssi + rssi_offset;
+    signal_rssi = signal_rssi + rssi_offset;
+
+    uint8_t ans_rssi[] = { CMD_STAT_RSSI, rssi };
     uint8_t ans_snr[] = { CMD_STAT_SNR, snr };
 
     kiss_encode(ans_rssi, sizeof(ans_rssi));

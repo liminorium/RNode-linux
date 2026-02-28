@@ -18,6 +18,7 @@
 #include <linux/spi/spidev.h>
 #include <gpiod.h>
 #include <pthread.h>
+#include <errno.h>
 
 #include "sx126x.h"
 
@@ -90,12 +91,21 @@ typedef enum {
     IRQ_NONE                = 0x0000
 } irq_t;
 
-static struct gpiod_line    *cs_line = NULL;
-static struct gpiod_line    *rst_line = NULL;
-static struct gpiod_line    *busy_line = NULL;
-static struct gpiod_line    *dio1_line = NULL;
-static struct gpiod_line    *tx_en_line = NULL;
-static struct gpiod_line    *rx_en_line = NULL;
+static struct gpiod_line_request    *cs_line = NULL;
+static struct gpiod_line_request    *rst_line = NULL;
+static struct gpiod_line_request    *busy_line = NULL;
+static struct gpiod_line_request    *dio1_line = NULL;
+static struct gpiod_line_request    *tx_en_line = NULL;
+static struct gpiod_line_request    *rx_en_line = NULL;
+
+// Store GPIO pin offsets for gpiod v2 API
+static unsigned int cs_offset = 0;
+static unsigned int rst_offset = 0;
+static unsigned int busy_offset = 0;
+static unsigned int dio1_offset = 0;
+static unsigned int tx_en_offset = 0;
+static unsigned int rx_en_offset = 0;
+
 static int                  spi_fd;
 
 static uint8_t              fifo_tx_addr_ptr = 0;
@@ -123,8 +133,20 @@ static sx126x_tx_done_callback_t    tx_done_callback = NULL;
 static sx126x_medium_callback_t     medium_callback = NULL;
 
 static void wait_on_busy() {
-    while (gpiod_line_get_value(busy_line) == 1) {
+    int timeout = 10000; // 1 second max (10000 * 100us)
+    int count = 0;
+    
+    while (gpiod_line_request_get_value(busy_line, busy_offset) == 1) {
         usleep(100);
+        count++;
+        if (count >= timeout) {
+            syslog(LOG_ERR, "BUSY timeout after %d ms!", count / 10);
+            break;
+        }
+    }
+    
+    if (count > 100) { // More than 10ms
+        syslog(LOG_WARNING, "BUSY took %d ms to clear", count / 10);
     }
 }
 
@@ -132,35 +154,35 @@ static void switch_ant() {
     switch (state) {
         case SX126X_IDLE:
             if (rx_en_line) {
-                gpiod_line_set_value(rx_en_line, 0);
+                gpiod_line_request_set_value(rx_en_line, rx_en_offset, 0);
             }
             if (tx_en_line) {
-                gpiod_line_set_value(tx_en_line, 0);
+                gpiod_line_request_set_value(tx_en_line, tx_en_offset, 0);
             }
             break;
 
         case SX126X_RX_SINGLE:
         case SX126X_RX_CONTINUOUS:
             if (tx_en_line) {
-                gpiod_line_set_value(tx_en_line, 0);
+                gpiod_line_request_set_value(tx_en_line, tx_en_offset, 0);
             }
 
             usleep(100);
 
             if (rx_en_line) {
-                gpiod_line_set_value(rx_en_line, 1);
+                gpiod_line_request_set_value(rx_en_line, rx_en_offset, 1);
             }
             break;
 
         case SX126X_TX:
             if (rx_en_line) {
-                gpiod_line_set_value(rx_en_line, 0);
+                gpiod_line_request_set_value(rx_en_line, rx_en_offset, 0);
             }
 
             usleep(100);
 
             if (tx_en_line) {
-                gpiod_line_set_value(tx_en_line, 1);
+                gpiod_line_request_set_value(tx_en_line, tx_en_offset, 1);
             }
             break;
     }
@@ -178,9 +200,11 @@ static bool write_bytes(const uint8_t *buf, size_t len) {
         .cs_change = 0,
     };
 
-    gpiod_line_set_value(cs_line, 0);
+    gpiod_line_request_set_value(cs_line, cs_offset, 0);
+    usleep(1); // Small delay after CS LOW
     int l = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &k);
-    gpiod_line_set_value(cs_line, 1);
+    usleep(1); // Small delay before CS HIGH
+    gpiod_line_request_set_value(cs_line, cs_offset, 1);
 
     return (l == k.len);
 }
@@ -204,9 +228,11 @@ static bool write_read_bytes(const uint8_t *buf, size_t buf_len, uint8_t *res, s
         }
     };
 
-    gpiod_line_set_value(cs_line, 0);
+    gpiod_line_request_set_value(cs_line, cs_offset, 0);
+    usleep(1); // Small delay after CS LOW
     int l = ioctl(spi_fd, SPI_IOC_MESSAGE(2), &k);
-    gpiod_line_set_value(cs_line, 1);
+    usleep(1); // Small delay before CS HIGH
+    gpiod_line_request_set_value(cs_line, cs_offset, 1);
 
     return (l == (buf_len + res_len));
 }
@@ -222,9 +248,24 @@ static bool read_bytes(const uint8_t *buf, uint8_t *res, size_t len) {
         .cs_change = 0,
     };
 
-    gpiod_line_set_value(cs_line, 0);
+    // Verify CS pin state
+    int cs_before = gpiod_line_request_get_value(cs_line, cs_offset);
+    
+    gpiod_line_request_set_value(cs_line, cs_offset, 0);
+    usleep(10); // Increase delay for debugging
     int l = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &k);
-    gpiod_line_set_value(cs_line, 1);
+    usleep(10); // Increase delay for debugging
+    gpiod_line_request_set_value(cs_line, cs_offset, 1);
+    
+    int cs_after = gpiod_line_request_get_value(cs_line, cs_offset);
+    
+    // Log SPI transaction details
+    syslog(LOG_INFO, "SPI read: CS %d->0->%d, sent %d bytes, received %d bytes", 
+           cs_before, cs_after, (int)len, l);
+    if (len >= 2 && len <= 4) {
+        syslog(LOG_INFO, "  TX: 0x%02X 0x%02X, RX: 0x%02X 0x%02X", 
+               buf[0], buf[1], res[0], res[1]);
+    }
 
     return (l == k.len);
 }
@@ -279,6 +320,7 @@ static bool set_standby(standby_t x) {
     return write_bytes(msg, sizeof(msg));
 }
 
+
 static bool set_packet_type(modem_t x) {
     uint8_t msg[] = { 0x8A, x };
 
@@ -287,12 +329,6 @@ static bool set_packet_type(modem_t x) {
 
 static bool calibrate(uint8_t x) {
     uint8_t msg[] = { 0x89, x };
-
-    return write_bytes(msg, sizeof(msg));
-}
-
-static bool regulator(uint8_t x) {
-    uint8_t msg[] = { 0x96, x };
 
     return write_bytes(msg, sizeof(msg));
 }
@@ -411,25 +447,36 @@ static void set_irq_mask() {
 /* * */
 
 static void * irq_worker(void *p) {
-    struct  gpiod_line_event event;
+    struct gpiod_edge_event_buffer *event_buffer;
+    struct gpiod_edge_event *event;
     bool    crc_ok = true;
 
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+
+    event_buffer = gpiod_edge_event_buffer_new(1);
+    if (!event_buffer) {
+        return NULL;
+    }
 
     while (state == SX126X_IDLE) {
         usleep(1000);
     }
 
     while (true) {
-        int res = gpiod_line_event_wait(dio1_line, NULL);
+        int res = gpiod_line_request_wait_edge_events(dio1_line, -1);
 
         if (res == 1) {
-            if (gpiod_line_event_read(dio1_line, &event) != 0) {
+            if (gpiod_line_request_read_edge_events(dio1_line, event_buffer, 1) <= 0) {
                 continue;
             }
 
-            if (event.event_type == GPIOD_LINE_EVENT_RISING_EDGE) {
+            event = gpiod_edge_event_buffer_get_event(event_buffer, 0);
+            if (!event) {
+                continue;
+            }
+
+            if (gpiod_edge_event_get_event_type(event) == GPIOD_EDGE_EVENT_RISING_EDGE) {
                 uint16_t    status = get_irq_status();
 
                 if (status & IRQ_CRC_ERR) {
@@ -511,84 +558,252 @@ bool sx126x_init_spi(const char *spidev, uint8_t cs_port, uint8_t cs_pin) {
     spi_fd = open(spidev, O_RDWR);
 
     if (spi_fd < 0) {
+        syslog(LOG_ERR, "Failed to open SPI device %s: %s", spidev, strerror(errno));
+        return false;
+    }
+    
+    // Configure SPI mode - CRITICAL: Use SPI_NO_CS to disable hardware CS control
+    // since we're manually controlling CS on GPIO 21, not the hardware CS on GPIO 8
+    uint8_t mode = SPI_MODE_0 | SPI_NO_CS;
+    if (ioctl(spi_fd, SPI_IOC_WR_MODE, &mode) < 0) {
+        syslog(LOG_ERR, "Failed to set SPI mode: %s", strerror(errno));
+        close(spi_fd);
+        return false;
+    }
+    syslog(LOG_INFO, "SPI configured with SPI_NO_CS flag (manual CS control)");
+    
+    // Configure bits per word
+    uint8_t bits = 8;
+    if (ioctl(spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0) {
+        syslog(LOG_ERR, "Failed to set SPI bits per word: %s", strerror(errno));
+        close(spi_fd);
+        return false;
+    }
+    
+    // Configure SPI speed
+    uint32_t speed = 1000000; // 1 MHz
+    if (ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
+        syslog(LOG_ERR, "Failed to set SPI speed: %s", strerror(errno));
+        close(spi_fd);
         return false;
     }
 
+    syslog(LOG_INFO, "SPI %s configured: mode=%d, bits=%d, speed=%d Hz", spidev, mode, bits, speed);
+
     syslog(LOG_INFO, "SPI %s, CS GPIO %i:%i", spidev, (int) cs_port, (int) cs_pin);
 
-    struct gpiod_chip *chip = gpiod_chip_open_by_number(cs_port);
+    char chip_path[32];
+    snprintf(chip_path, sizeof(chip_path), "/dev/gpiochip%d", cs_port);
 
+    struct gpiod_chip *chip = gpiod_chip_open(chip_path);
     if (!chip) {
         return false;
     }
 
-    cs_line = gpiod_chip_get_line(chip, cs_pin);
+    struct gpiod_line_settings *settings = gpiod_line_settings_new();
+    if (!settings) {
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+    gpiod_line_settings_set_output_value(settings, GPIOD_LINE_VALUE_ACTIVE);
+
+    struct gpiod_line_config *line_cfg = gpiod_line_config_new();
+    if (!line_cfg) {
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    unsigned int offset = cs_pin;
+    cs_offset = cs_pin;  // Store for later use
+    gpiod_line_config_add_line_settings(line_cfg, &offset, 1, settings);
+
+    struct gpiod_request_config *req_cfg = gpiod_request_config_new();
+    if (!req_cfg) {
+        gpiod_line_config_free(line_cfg);
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    gpiod_request_config_set_consumer(req_cfg, "sx126x_cs");
+
+    cs_line = gpiod_chip_request_lines(chip, req_cfg, line_cfg);
+
+    gpiod_request_config_free(req_cfg);
+    gpiod_line_config_free(line_cfg);
+    gpiod_line_settings_free(settings);
+    gpiod_chip_close(chip);
 
     if (!cs_line) {
         return false;
     }
 
-    gpiod_line_request_output(cs_line, "sx126x_cs", 1);
-
     return true;
 }
 
 bool sx126x_init_rst(uint8_t port, uint8_t pin) {
-    struct gpiod_chip *chip = gpiod_chip_open_by_number(port);
-
     syslog(LOG_INFO, "RST GPIO %i:%i", (int) port, (int) pin);
 
+    char chip_path[32];
+    snprintf(chip_path, sizeof(chip_path), "/dev/gpiochip%d", port);
+
+    struct gpiod_chip *chip = gpiod_chip_open(chip_path);
     if (!chip) {
         return false;
     }
 
-    rst_line = gpiod_chip_get_line(chip, pin);
+    struct gpiod_line_settings *settings = gpiod_line_settings_new();
+    if (!settings) {
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+    gpiod_line_settings_set_output_value(settings, GPIOD_LINE_VALUE_INACTIVE);
+
+    struct gpiod_line_config *line_cfg = gpiod_line_config_new();
+    if (!line_cfg) {
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    unsigned int offset = pin;
+    rst_offset = pin;  // Store for later use
+    gpiod_line_config_add_line_settings(line_cfg, &offset, 1, settings);
+
+    struct gpiod_request_config *req_cfg = gpiod_request_config_new();
+    if (!req_cfg) {
+        gpiod_line_config_free(line_cfg);
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    gpiod_request_config_set_consumer(req_cfg, "sx126x_rst");
+
+    rst_line = gpiod_chip_request_lines(chip, req_cfg, line_cfg);
+
+    gpiod_request_config_free(req_cfg);
+    gpiod_line_config_free(line_cfg);
+    gpiod_line_settings_free(settings);
+    gpiod_chip_close(chip);
 
     if (!rst_line) {
         return false;
     }
 
-    gpiod_line_request_output(rst_line, "sx126x_rst", 0);
-
     return true;
 }
 
 bool sx126x_init_busy(uint8_t port, uint8_t pin) {
-    struct gpiod_chip *chip = gpiod_chip_open_by_number(port);
-
     syslog(LOG_INFO, "Busy GPIO %i:%i", (int) port, (int) pin);
 
+    char chip_path[32];
+    snprintf(chip_path, sizeof(chip_path), "/dev/gpiochip%d", port);
+
+    struct gpiod_chip *chip = gpiod_chip_open(chip_path);
     if (!chip) {
         return false;
     }
 
-    busy_line = gpiod_chip_get_line(chip, pin);
+    struct gpiod_line_settings *settings = gpiod_line_settings_new();
+    if (!settings) {
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
+    gpiod_line_settings_set_bias(settings, GPIOD_LINE_BIAS_PULL_DOWN);
+
+    struct gpiod_line_config *line_cfg = gpiod_line_config_new();
+    if (!line_cfg) {
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    unsigned int offset = pin;
+    busy_offset = pin;  // Store for later use
+    gpiod_line_config_add_line_settings(line_cfg, &offset, 1, settings);
+
+    struct gpiod_request_config *req_cfg = gpiod_request_config_new();
+    if (!req_cfg) {
+        gpiod_line_config_free(line_cfg);
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    gpiod_request_config_set_consumer(req_cfg, "sx126x_busy");
+
+    busy_line = gpiod_chip_request_lines(chip, req_cfg, line_cfg);
+
+    gpiod_request_config_free(req_cfg);
+    gpiod_line_config_free(line_cfg);
+    gpiod_line_settings_free(settings);
+    gpiod_chip_close(chip);
 
     if (!busy_line) {
         return false;
     }
 
-    gpiod_line_request_input(busy_line, "sx126x_busy");
-
     return true;
 }
 
 bool sx126x_init_dio1(uint8_t port, uint8_t pin) {
-    struct gpiod_chip *chip = gpiod_chip_open_by_number(port);
-
     syslog(LOG_INFO, "DIO1 GPIO %i:%i", (int) port, (int) pin);
 
+    char chip_path[32];
+    snprintf(chip_path, sizeof(chip_path), "/dev/gpiochip%d", port);
+
+    struct gpiod_chip *chip = gpiod_chip_open(chip_path);
     if (!chip) {
         return false;
     }
 
-    dio1_line = gpiod_chip_get_line(chip, pin);
+    struct gpiod_line_settings *settings = gpiod_line_settings_new();
+    if (!settings) {
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
+    gpiod_line_settings_set_edge_detection(settings, GPIOD_LINE_EDGE_BOTH);
+
+    struct gpiod_line_config *line_cfg = gpiod_line_config_new();
+    if (!line_cfg) {
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    unsigned int offset = pin;
+    gpiod_line_config_add_line_settings(line_cfg, &offset, 1, settings);
+
+    struct gpiod_request_config *req_cfg = gpiod_request_config_new();
+    if (!req_cfg) {
+        gpiod_line_config_free(line_cfg);
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    gpiod_request_config_set_consumer(req_cfg, "sx126x_dio1");
+
+    dio1_line = gpiod_chip_request_lines(chip, req_cfg, line_cfg);
+
+    gpiod_request_config_free(req_cfg);
+    gpiod_line_config_free(line_cfg);
+    gpiod_line_settings_free(settings);
+    gpiod_chip_close(chip);
 
     if (!dio1_line) {
         return false;
     }
-
-    gpiod_line_request_both_edges_events(dio1_line, "sx126x_dio1");
 
     pthread_t thread;
 
@@ -599,41 +814,111 @@ bool sx126x_init_dio1(uint8_t port, uint8_t pin) {
 }
 
 bool sx126x_init_tx_en(uint8_t port, uint8_t pin) {
-    struct gpiod_chip *chip = gpiod_chip_open_by_number(port);
-
     syslog(LOG_INFO, "TX EN GPIO %i:%i", (int) port, (int) pin);
 
+    char chip_path[32];
+    snprintf(chip_path, sizeof(chip_path), "/dev/gpiochip%d", port);
+
+    struct gpiod_chip *chip = gpiod_chip_open(chip_path);
     if (!chip) {
         return false;
     }
 
-    tx_en_line = gpiod_chip_get_line(chip, pin);
+    struct gpiod_line_settings *settings = gpiod_line_settings_new();
+    if (!settings) {
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+    gpiod_line_settings_set_output_value(settings, GPIOD_LINE_VALUE_INACTIVE);
+
+    struct gpiod_line_config *line_cfg = gpiod_line_config_new();
+    if (!line_cfg) {
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    unsigned int offset = pin;
+    tx_en_offset = pin;  // Store for later use
+    gpiod_line_config_add_line_settings(line_cfg, &offset, 1, settings);
+
+    struct gpiod_request_config *req_cfg = gpiod_request_config_new();
+    if (!req_cfg) {
+        gpiod_line_config_free(line_cfg);
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    gpiod_request_config_set_consumer(req_cfg, "sx126x_tx_en");
+
+    tx_en_line = gpiod_chip_request_lines(chip, req_cfg, line_cfg);
+
+    gpiod_request_config_free(req_cfg);
+    gpiod_line_config_free(line_cfg);
+    gpiod_line_settings_free(settings);
+    gpiod_chip_close(chip);
 
     if (!tx_en_line) {
         return false;
     }
 
-    gpiod_line_request_output(tx_en_line, "sx126x_tx_en", 0);
-
     return true;
 }
 
 bool sx126x_init_rx_en(uint8_t port, uint8_t pin) {
-    struct gpiod_chip *chip = gpiod_chip_open_by_number(port);
-
     syslog(LOG_INFO, "RX EN GPIO %i:%i", (int) port, (int) pin);
 
+    char chip_path[32];
+    snprintf(chip_path, sizeof(chip_path), "/dev/gpiochip%d", port);
+
+    struct gpiod_chip *chip = gpiod_chip_open(chip_path);
     if (!chip) {
         return false;
     }
 
-    rx_en_line = gpiod_chip_get_line(chip, pin);
+    struct gpiod_line_settings *settings = gpiod_line_settings_new();
+    if (!settings) {
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+    gpiod_line_settings_set_output_value(settings, GPIOD_LINE_VALUE_INACTIVE);
+
+    struct gpiod_line_config *line_cfg = gpiod_line_config_new();
+    if (!line_cfg) {
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    unsigned int offset = pin;
+    rx_en_offset = pin;  // Store for later use
+    gpiod_line_config_add_line_settings(line_cfg, &offset, 1, settings);
+
+    struct gpiod_request_config *req_cfg = gpiod_request_config_new();
+    if (!req_cfg) {
+        gpiod_line_config_free(line_cfg);
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(chip);
+        return false;
+    }
+
+    gpiod_request_config_set_consumer(req_cfg, "sx126x_rx_en");
+
+    rx_en_line = gpiod_chip_request_lines(chip, req_cfg, line_cfg);
+
+    gpiod_request_config_free(req_cfg);
+    gpiod_line_config_free(line_cfg);
+    gpiod_line_settings_free(settings);
+    gpiod_chip_close(chip);
 
     if (!rx_en_line) {
         return false;
     }
-
-    gpiod_line_request_output(rx_en_line, "sx126x_rx_en", 0);
 
     return true;
 }
@@ -651,42 +936,94 @@ void sx126x_set_medium_callback(sx126x_medium_callback_t callback) {
 }
 
 bool sx126x_begin() {
-    gpiod_line_set_value(rst_line, 0);
-    usleep(10000);
-    gpiod_line_set_value(rst_line, 1);
-    usleep(10000);
+    syslog(LOG_INFO, "Starting radio reset sequence");
+    
+    gpiod_line_request_set_value(rst_line, rst_offset, 0);
+    usleep(100000);  // 100ms reset LOW
+    gpiod_line_request_set_value(rst_line, rst_offset, 1);
+    usleep(100000);  // 100ms delay after reset
+    
+    syslog(LOG_INFO, "Reset complete, checking GPIO states");
 
     state = SX126X_IDLE;
     switch_ant();
-
-    if (!set_standby(STANDBY_RC)) {
-        return false;
+    
+    // Wait for BUSY to stabilize after reset
+    usleep(10000);
+    
+    // Check BUSY pin state
+    int busy_state = gpiod_line_request_get_value(busy_line, busy_offset);
+    syslog(LOG_INFO, "BUSY pin state after reset: %d (should be 0)", busy_state);
+    
+    if (busy_state == 1) {
+        syslog(LOG_WARNING, "BUSY is HIGH after reset, waiting...");
+        wait_on_busy();
     }
 
-    if ((sx126x_get_status_mode() & 0x70) != STATUS_MODE_STDBY_RC) {
+    // First command after reset must be SetStandby
+    syslog(LOG_INFO, "Sending SetStandby(RC) command");
+    if (!set_standby(STANDBY_RC)) {
+        syslog(LOG_ERR, "Failed to set standby RC");
+        return false;
+    }
+    syslog(LOG_INFO, "Set standby RC successful");
+
+    // Verify SPI is working by checking GetStatus response
+    syslog(LOG_INFO, "Verifying SPI communication with GetStatus");
+    uint8_t initial_status = sx126x_get_status_mode();
+    if (initial_status == 0x00) {
+        syslog(LOG_ERR, "GetStatus returned 0x00 - SPI communication failure!");
+        syslog(LOG_ERR, "Check: 1) MISO connected, 2) Radio powered, 3) SPI enabled");
+        return false;
+    }
+    syslog(LOG_INFO, "Initial status: 0x%02X - SPI communication OK", initial_status);
+    
+    // Configure TCXO immediately after first standby command
+    // This must be done BEFORE checking status or setting packet type
+    syslog(LOG_INFO, "Configuring TCXO");
+    sx126x_set_dio3_txco_ctrl(DIO3_OUTPUT_1_8, TXCO_DELAY_10);
+    
+    // Now check if we're in standby with XOSC
+    uint8_t status = sx126x_get_status_mode() & 0x70;
+    syslog(LOG_INFO, "Radio status after TCXO: 0x%02X (expected 0x%02X or 0x%02X)", 
+           status, STATUS_MODE_STDBY_XOSC, STATUS_MODE_STDBY_RC);
+    if (status != STATUS_MODE_STDBY_XOSC && status != STATUS_MODE_STDBY_RC) {
+        syslog(LOG_ERR, "Radio not in standby mode after TCXO config");
+        syslog(LOG_ERR, "This indicates SPI communication is not working!");
         return false;
     }
 
     if (!set_packet_type(LORA_MODEM)) {
+        syslog(LOG_ERR, "Failed to set LoRa packet type");
         return false;
     }
+    syslog(LOG_INFO, "Set LoRa packet type successful");
 
     uint8_t base_addr[] = { 0x8F, 0, 0 };
 
     wait_on_busy();
     write_bytes(base_addr, sizeof(base_addr));
+    syslog(LOG_INFO, "Set base addresses successful");
 
     set_irq_mask();
+    syslog(LOG_INFO, "Radio initialization complete");
 
     return true;
 }
 
 void sx126x_set_dio3_txco_ctrl(uint8_t voltage, uint16_t delay) {
-    uint8_t msg[] = { 0x97, voltage, (delay >> 16) & 0xFF, (delay >> 8) & 0xFF, delay &0xFF };
+    uint8_t msg[] = { 0x97, voltage, (delay >> 16) & 0xFF, (delay >> 8) & 0xFF, delay & 0xFF };
 
+    wait_on_busy();
     write_bytes(msg, sizeof(msg));
+    
+    // Wait for TCXO to stabilize
+    usleep(delay);
 
-    set_standby(STANDBY_RC);
+    wait_on_busy();
+    set_standby(STANDBY_XOSC);  // Use XOSC, not RC!
+    
+    wait_on_busy();
     calibrate(0xFF);
 }
 
@@ -722,29 +1059,30 @@ void sx126x_set_freq(uint64_t x) {
 }
 
 void sx126x_set_tx_power(uint8_t db) {
-    /* Tuned for E22-...M30S */
-
-    if (db > 30) {
-        db = 30;
+    if (db > 22) {
+        db = 22;
     }
 
-    if (db < 8) {
-        db = 8;
-    }
-
+    // PA configuration for E22-900M30S (SX1262 with high power PA)
+    // paDutyCycle=0x04, hpMax=0x07, deviceSel=0x00 (SX1262), paLut=0x01
     uint8_t pa_config[] = { 0x95, 0x04, 0x07, 0x00, 0x01 };
 
     wait_on_busy();
     write_bytes(pa_config, sizeof(pa_config));
 
-    uint8_t ocp_param[] = { db > 22 ? 0x38 : 0x18 };
+    // Set regulator mode to DC-DC for better efficiency
+    uint8_t regulator_mode[] = { 0x96, 0x01 };  // 0x01 = DC-DC mode
+    
+    wait_on_busy();
+    write_bytes(regulator_mode, sizeof(regulator_mode));
+
+    // OCP configuration - 140mA for high power operation
+    uint8_t ocp_param[] = { 0x38 };  // 0x38 = 140mA (increased from 0x18=60mA)
 
     wait_on_busy();
     write_reg(REG_OCP_CONFIGURATION, ocp_param, sizeof(ocp_param));
 
-    regulator(db > 22 ? 0x01 : 0x11);
-
-    int8_t tx_params[] = { 0x8E, db - 17, PA_RAMP_200U };
+    uint8_t tx_params[] = { 0x8E, db, PA_RAMP_40U };
 
     wait_on_busy();
     write_bytes(tx_params, sizeof(tx_params));
@@ -814,6 +1152,7 @@ void sx126x_write(const uint8_t *buf, uint8_t len) {
 
 void sx126x_end_packet() {
     state = SX126X_TX;
+    syslog(LOG_INFO, "Starting TX with %d bytes", payload_tx_rx);
 
     wait_on_busy();
     set_packet_params_loRa(save_preamble_len, save_header_type, payload_tx_rx, save_crc);
@@ -823,6 +1162,11 @@ void sx126x_end_packet() {
 
     wait_on_busy();
     set_tx(0);
+    
+    // Check if radio entered TX mode
+    usleep(1000);
+    uint8_t status = sx126x_get_status_mode() & 0x70;
+    syslog(LOG_INFO, "Radio status after SetTx: 0x%02X (expected 0x%02X for TX)", status, STATUS_MODE_TX);
 }
 
 void sx126x_request(uint32_t timeout) {
@@ -921,6 +1265,9 @@ status_mode_t sx126x_get_status_mode() {
     uint8_t res[] = { 0x00, 0x00 };
 
     read_bytes(msg, res, sizeof(msg));
+    
+    // Log the raw response for debugging
+    syslog(LOG_DEBUG, "GetStatus response: 0x%02X 0x%02X", res[0], res[1]);
 
     return res[1];
 }

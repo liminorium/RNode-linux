@@ -17,6 +17,7 @@
 #include "util.h"
 #include "rnode.h"
 #include "csma.h"
+#include "sx126x.h"
 
 typedef struct item_t {
     uint8_t         *data;
@@ -46,8 +47,21 @@ static bool send_packet() {
 
         pthread_mutex_unlock(&mux);
 
+        // Calculate airtime for this packet
+        uint32_t airtime = sx126x_air_time(item->len, NULL, NULL);
+        
+        // Check if airtime locks allow transmission
+        if (!rnode_check_airtime_lock(airtime)) {
+            syslog(LOG_INFO, "Airtime lock: deferring transmission");
+            return false;  // Don't remove from queue, try again later
+        }
+
         syslog(LOG_INFO, "Queue: pop to air (%i)", item->len);
-        tx_wait_timeout = get_time() + rnode_to_air(item->data, item->len) * 2;
+        uint32_t actual_airtime = rnode_to_air(item->data, item->len);
+        tx_wait_timeout = get_time() + actual_airtime * 2;
+        
+        // Update airtime usage after successful transmission
+        rnode_update_airtime_usage(actual_airtime);
 
         pthread_mutex_lock(&mux);
 
@@ -90,8 +104,12 @@ static void * queue_worker(void *p) {
                 }
             } else {
                 if (now >= tx_disabled) {
-                    syslog(LOG_WARNING, "TX disabled to long!");
+                    // TX was disabled (waiting for RX) but timed out
+                    // This can happen with false preamble detections or interference
+                    // Just re-enable TX instead of restarting the radio
+                    syslog(LOG_DEBUG, "TX disabled timeout - re-enabling (likely false preamble detection)");
                     tx_enable = true;
+                    tx_delay = now + csma_get_cw();
                 }
             }
         } else if (now > tx_wait_timeout) {
@@ -147,12 +165,13 @@ void queue_medium_state(cause_medium_t cause) {
     switch(cause) {
         case CAUSE_INIT:
         case CAUSE_TX_DONE:
-            tx_enable = free;
+            tx_enable = true;
             tx_delay = now;
+            break;
 
         case CAUSE_RX_DONE:
         case CAUSE_HEADER_ERR:
-            tx_enable = free;
+            tx_enable = true;
             tx_delay = now + csma_get_cw();
             break;
 

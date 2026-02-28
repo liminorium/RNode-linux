@@ -29,6 +29,8 @@
 #define AIRTIME_BINLEN_MS           (STATUS_INTERVAL_MS * DCD_SAMPLES)
 #define AIRTIME_BINS                ((AIRTIME_LONGTERM * 1000) / AIRTIME_BINLEN_MS)
 
+#define NOISE_FLOOR_SAMPLES         100
+
 static csma_channel_t   channel = {
     .airtime = 0.0,
     .longterm_airtime = 0.0,
@@ -45,6 +47,11 @@ static uint16_t         airtime_bins[AIRTIME_BINS];
 static float            longterm_bins[AIRTIME_BINS];
 
 static int32_t          csma_slot_ms = CSMA_SLOT_MIN_MS;
+
+// Noise floor tracking
+static int32_t          noise_floor_samples[NOISE_FLOOR_SAMPLES];
+static uint16_t         noise_floor_index = 0;
+static uint16_t         noise_floor_count = 0;
 
 static long map(long x, long in_min, long in_max, long out_min, long out_max) {
     const long run = in_max - in_min;
@@ -137,5 +144,29 @@ uint32_t csma_get_cw() {
 }
 
 void csma_update_current_rssi() {
+    // Only read RSSI if radio is in RX mode
+    state_t radio_state = sx126x_get_state();
+    if (radio_state != SX126X_RX_SINGLE && radio_state != SX126X_RX_CONTINUOUS) {
+        return;
+    }
+    
     channel.current_rssi = sx126x_current_rssi();
+    
+    // Update noise floor with rolling window
+    noise_floor_samples[noise_floor_index] = channel.current_rssi;
+    noise_floor_index = (noise_floor_index + 1) % NOISE_FLOOR_SAMPLES;
+    
+    // Track how many samples we have (up to NOISE_FLOOR_SAMPLES)
+    if (noise_floor_count < NOISE_FLOOR_SAMPLES) {
+        noise_floor_count++;
+    }
+    
+    // Calculate noise floor as minimum of recent samples
+    int32_t min_rssi = noise_floor_samples[0];
+    for (uint16_t i = 1; i < noise_floor_count; i++) {
+        if (noise_floor_samples[i] < min_rssi) {
+            min_rssi = noise_floor_samples[i];
+        }
+    }
+    channel.noise_floor = min_rssi;
 }

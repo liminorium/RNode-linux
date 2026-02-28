@@ -27,3 +27,6 @@ void rnode_rx_done(uint16_t len);
 
 void rnode_send_stat_csma(csma_cw_t *cw);
 void rnode_send_stat_channel(csma_channel_t *channel);
+
+bool rnode_check_airtime_lock(uint32_t packet_airtime);
+void rnode_update_airtime_usage(uint32_t packet_airtime);
