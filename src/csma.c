@@ -143,6 +143,10 @@ uint32_t csma_get_cw() {
     return random() % (cw.max - cw.min) + cw.min * csma_slot_ms;
 }
 
+void csma_get_channel(csma_channel_t *out) {
+    *out = channel;
+}
+
 void csma_update_current_rssi() {
     // Only read RSSI if radio is in RX mode
     state_t radio_state = sx126x_get_state();

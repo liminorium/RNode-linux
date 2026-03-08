@@ -30,3 +30,4 @@ void csma_update_airtime();
 void csma_update_current_rssi();
 void csma_add_airtime(uint32_t ms);
 uint32_t csma_get_cw();
+void csma_get_channel(csma_channel_t *out);

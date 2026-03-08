@@ -21,6 +21,7 @@
 #include <errno.h>
 
 #include "sx126x.h"
+#include "rnode.h"
 
 #define PHY_HEADER_LORA_SYMBOLS     20
 #define PHY_CRC_LORA_BITS           16
@@ -133,6 +134,7 @@ static sx126x_tx_done_callback_t    tx_done_callback = NULL;
 static sx126x_medium_callback_t     medium_callback = NULL;
 
 static void wait_on_busy() {
+    static bool recovering = false;
     int timeout = 10000; // 1 second max (10000 * 100us)
     int count = 0;
     
@@ -140,7 +142,13 @@ static void wait_on_busy() {
         usleep(100);
         count++;
         if (count >= timeout) {
-            syslog(LOG_ERR, "BUSY timeout after %d ms!", count / 10);
+            syslog(LOG_ERR, "BUSY timeout after %d ms - attempting radio recovery", count / 10);
+            if (!recovering) {
+                recovering = true;
+                sx126x_begin();
+                rnode_report_error(ERROR_INITRADIO);
+                recovering = false;
+            }
             break;
         }
     }

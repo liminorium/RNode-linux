@@ -28,6 +28,7 @@ typedef struct item_t {
 static struct item_t    *head = NULL;
 static struct item_t    *tail = NULL;
 static pthread_mutex_t  mux;
+static uint16_t         queue_depth = 0;
 
 static bool             tx_enable = false;
 static uint64_t         tx_delay;
@@ -74,9 +75,13 @@ static bool send_packet() {
         free(item->data);
         free(item);
 
+        queue_depth--;
+        uint16_t depth = queue_depth;
+
         res = true;
 
         pthread_mutex_unlock(&mux);
+        rnode_send_stat_queue(depth);
         csma_update_airtime();
     }
 
@@ -156,8 +161,13 @@ void queue_push(const uint8_t *buf, size_t len) {
         tail = item;
     }
 
+    queue_depth++;
+    uint16_t depth = queue_depth;
+
     pthread_mutex_unlock(&mux);
+    rnode_send_stat_queue(depth);
 }
+
 
 void queue_medium_state(cause_medium_t cause) {
     uint64_t    now = get_time();
@@ -185,4 +195,11 @@ void queue_medium_state(cause_medium_t cause) {
             tx_disabled = now + tx_data_timeout;
             break;
     }
+}
+
+uint16_t queue_get_depth() {
+    pthread_mutex_lock(&mux);
+    uint16_t depth = queue_depth;
+    pthread_mutex_unlock(&mux);
+    return depth;
 }

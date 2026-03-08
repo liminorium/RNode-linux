@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <syslog.h>
 #include <time.h>
+#include <sys/random.h>
 
 #include "rnode.h"
 #include "kiss.h"
@@ -51,6 +52,7 @@
 #define CMD_STAT_BAT        0x27
 #define CMD_STAT_CSMA       0x28
 #define CMD_STAT_TEMP       0x29
+#define CMD_STAT_QUEUE      0x2A
 #define CMD_BLINK           0x30
 #define CMD_RANDOM          0x40
 #define CMD_RSSI_OFFSET     0x4A
@@ -113,14 +115,6 @@
 #define FLAG_SPLIT          0x01
 #define SEQ_UNSET           0xFF
 
-#define CMD_ERROR           0x90
-#define ERROR_INITRADIO     0x01
-#define ERROR_TXFAILED      0x02
-#define ERROR_EEPROM_LOCKED 0x03
-#define ERROR_QUEUE_FULL    0x04
-#define ERROR_MEMORY_LOW    0x05
-#define ERROR_MODEM_TIMEOUT 0x06
-
 static uint8_t  seq = SEQ_UNSET;
 static uint8_t  buf_in[MTU];
 static size_t   len_in = 0;
@@ -148,6 +142,14 @@ static time_t   lt_window_start = 0;
 
 /* * */
 
+void rnode_report_error(uint8_t error_code) {
+    uint8_t ans[] = { CMD_ERROR, error_code };
+    kiss_encode(ans, sizeof(ans));
+    syslog(LOG_ERR, "RNode error: 0x%02X", error_code);
+}
+
+/* * */
+
 static void ans_detect(const uint8_t *param) {
     uint8_t ans[] = { CMD_DETECT, DETECT_RESP };
 
@@ -160,14 +162,20 @@ static void ans_fw_version(const uint8_t *param) {
     kiss_encode(ans, sizeof(ans));
 }
 
+static void ans_board(const uint8_t *param) {
+    uint8_t ans[] = { CMD_BOARD, 0x60 };  // 0x60 = Generic board type for Linux implementation
+
+    kiss_encode(ans, sizeof(ans));
+}
+
 static void ans_platform(const uint8_t *param) {
-    uint8_t ans[] = { CMD_PLATFORM, 0x60 };
+    uint8_t ans[] = { CMD_PLATFORM, 0xFF };  // Custom platform for Linux
 
     kiss_encode(ans, sizeof(ans));
 }
 
 static void ans_mcu(const uint8_t *param) {
-    uint8_t ans[] = { CMD_MCU, 1, 1 };
+    uint8_t ans[] = { CMD_MCU, 0xFF };  // Not applicable for Linux
 
     kiss_encode(ans, sizeof(ans));
 }
@@ -316,6 +324,62 @@ static void ans_implicit(const uint8_t *param) {
     kiss_encode(ans, sizeof(ans));
 }
 
+static void ans_random(const uint8_t *param) {
+    uint8_t ans[17];
+    ans[0] = CMD_RANDOM;
+
+    if (getrandom(&ans[1], 16, 0) != 16) {
+        FILE *f = fopen("/dev/urandom", "rb");
+        if (f) {
+            fread(&ans[1], 1, 16, f);
+            fclose(f);
+        }
+    }
+
+    kiss_encode(ans, sizeof(ans));
+}
+
+static void ans_stat_queue(const uint8_t *param) {
+    uint16_t depth = queue_get_depth();
+    uint8_t ans[] = { CMD_STAT_QUEUE, depth >> 8, depth & 0xFF };
+    kiss_encode(ans, sizeof(ans));
+}
+
+static void ans_stat_chtm(const uint8_t *param) {
+    csma_channel_t ch;
+    csma_get_channel(&ch);
+    rnode_send_stat_channel(&ch);
+}
+
+static void ans_radio_lock(const uint8_t *param) {
+    // Always unlocked on Linux (no EEPROM lock mechanism)
+    uint8_t ans[] = { CMD_RADIO_LOCK, 0x00 };
+    kiss_encode(ans, sizeof(ans));
+}
+
+static bool promisc = false;
+
+static void ans_promisc(const uint8_t *param) {
+    promisc = param[0] ? true : false;
+    syslog(LOG_INFO, "Promiscuous mode %s", promisc ? "enabled" : "disabled");
+    uint8_t ans[] = { CMD_PROMISC, promisc ? 0x01 : 0x00 };
+    kiss_encode(ans, sizeof(ans));
+}
+
+static void ans_ready(const uint8_t *param) {
+    uint8_t ans[] = { CMD_READY, 0x01 };
+    kiss_encode(ans, sizeof(ans));
+}
+
+static void ans_reset(const uint8_t *param) {
+    if (param[0] == CMD_RESET_BYTE) {
+        syslog(LOG_INFO, "Radio reset requested");
+        rnode_start();
+        uint8_t ans[] = { CMD_RESET, 0x00 };
+        kiss_encode(ans, sizeof(ans));
+    }
+}
+
 static void ans_st_alock(const uint8_t *param) {
     st_airtime_limit = (param[0] << 8) | param[1];
     
@@ -406,7 +470,10 @@ void rnode_update_airtime_usage(uint32_t packet_airtime) {
 /* * */
 
 void rnode_start() {
-    sx126x_begin();
+    if (!sx126x_begin()) {
+        rnode_report_error(ERROR_INITRADIO);
+        return;
+    }
 
     sx126x_set_freq(current_freq);
     sx126x_set_tx_power(current_tx_power);
@@ -438,6 +505,10 @@ void rnode_from_channel(const uint8_t *buf, size_t len) {
 
         case CMD_FW_VERSION:
             ans_fw_version(buf);
+            break;
+
+        case CMD_BOARD:
+            ans_board(buf);
             break;
 
         case CMD_PLATFORM:
@@ -492,6 +563,34 @@ void rnode_from_channel(const uint8_t *buf, size_t len) {
             ans_lt_alock(buf);
             break;
 
+        case CMD_RANDOM:
+            ans_random(buf);
+            break;
+
+        case CMD_STAT_QUEUE:
+            ans_stat_queue(buf);
+            break;
+
+        case CMD_STAT_CHTM:
+            ans_stat_chtm(buf);
+            break;
+
+        case CMD_RADIO_LOCK:
+            ans_radio_lock(buf);
+            break;
+
+        case CMD_PROMISC:
+            ans_promisc(buf);
+            break;
+
+        case CMD_READY:
+            ans_ready(buf);
+            break;
+
+        case CMD_RESET:
+            ans_reset(buf);
+            break;
+
         case CMD_DATA:
             queue_push(buf, len);
             break;
@@ -500,7 +599,8 @@ void rnode_from_channel(const uint8_t *buf, size_t len) {
             break;
 
         default:
-            syslog(LOG_WARNING, "RNode unknown %02X", cmd);
+            syslog(LOG_WARNING, "RNode unknown command: 0x%02X", cmd);
+            rnode_report_error(ERROR_INVALID_COMMAND);
             break;
     }
 }
@@ -666,6 +766,11 @@ void rnode_rx_done(uint16_t len) {
 void rnode_send_stat_csma(csma_cw_t *cw) {
     uint8_t ans[] = { CMD_STAT_CSMA, cw->band, cw->min, cw->max };
 
+    kiss_encode(ans, sizeof(ans));
+}
+
+void rnode_send_stat_queue(uint16_t depth) {
+    uint8_t ans[] = { CMD_STAT_QUEUE, depth >> 8, depth & 0xFF };
     kiss_encode(ans, sizeof(ans));
 }
 
