@@ -41,5 +41,5 @@ void rnode_send_stat_queue(uint16_t depth);
 
 void rnode_report_error(uint8_t error_code);
 
-bool rnode_check_airtime_lock(uint32_t packet_airtime);
-void rnode_update_airtime_usage(uint32_t packet_airtime);
+bool rnode_check_airtime_lock();
+void rnode_indicate_reset();

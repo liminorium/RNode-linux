@@ -116,6 +116,8 @@ void tcp_read() {
 
                 syslog(LOG_INFO, "Client connected from %s:%d",
                        inet_ntoa(address.sin_addr), ntohs(address.sin_port));
+
+                rnode_indicate_reset();
             }
         }
 

@@ -108,6 +108,7 @@ static unsigned int tx_en_offset = 0;
 static unsigned int rx_en_offset = 0;
 
 static int                  spi_fd;
+static pthread_mutex_t      spi_mutex;
 
 static uint8_t              fifo_tx_addr_ptr = 0;
 static uint8_t              fifo_rx_addr_ptr = 0;
@@ -208,11 +209,13 @@ static bool write_bytes(const uint8_t *buf, size_t len) {
         .cs_change = 0,
     };
 
+    pthread_mutex_lock(&spi_mutex);
     gpiod_line_request_set_value(cs_line, cs_offset, 0);
-    usleep(1); // Small delay after CS LOW
+    usleep(1);
     int l = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &k);
-    usleep(1); // Small delay before CS HIGH
+    usleep(1);
     gpiod_line_request_set_value(cs_line, cs_offset, 1);
+    pthread_mutex_unlock(&spi_mutex);
 
     return (l == k.len);
 }
@@ -236,11 +239,13 @@ static bool write_read_bytes(const uint8_t *buf, size_t buf_len, uint8_t *res, s
         }
     };
 
+    pthread_mutex_lock(&spi_mutex);
     gpiod_line_request_set_value(cs_line, cs_offset, 0);
-    usleep(1); // Small delay after CS LOW
+    usleep(1);
     int l = ioctl(spi_fd, SPI_IOC_MESSAGE(2), &k);
-    usleep(1); // Small delay before CS HIGH
+    usleep(1);
     gpiod_line_request_set_value(cs_line, cs_offset, 1);
+    pthread_mutex_unlock(&spi_mutex);
 
     return (l == (buf_len + res_len));
 }
@@ -256,24 +261,13 @@ static bool read_bytes(const uint8_t *buf, uint8_t *res, size_t len) {
         .cs_change = 0,
     };
 
-    // Verify CS pin state
-    int cs_before = gpiod_line_request_get_value(cs_line, cs_offset);
-    
+    pthread_mutex_lock(&spi_mutex);
     gpiod_line_request_set_value(cs_line, cs_offset, 0);
-    usleep(10); // Increase delay for debugging
+    usleep(1);
     int l = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &k);
-    usleep(10); // Increase delay for debugging
+    usleep(1);
     gpiod_line_request_set_value(cs_line, cs_offset, 1);
-    
-    int cs_after = gpiod_line_request_get_value(cs_line, cs_offset);
-    
-    // Log SPI transaction details
-    syslog(LOG_INFO, "SPI read: CS %d->0->%d, sent %d bytes, received %d bytes", 
-           cs_before, cs_after, (int)len, l);
-    if (len >= 2 && len <= 4) {
-        syslog(LOG_INFO, "  TX: 0x%02X 0x%02X, RX: 0x%02X 0x%02X", 
-               buf[0], buf[1], res[0], res[1]);
-    }
+    pthread_mutex_unlock(&spi_mutex);
 
     return (l == k.len);
 }
@@ -597,6 +591,8 @@ bool sx126x_init_spi(const char *spidev, uint8_t cs_port, uint8_t cs_pin) {
     }
 
     syslog(LOG_INFO, "SPI %s configured: mode=%d, bits=%d, speed=%d Hz", spidev, mode, bits, speed);
+
+    pthread_mutex_init(&spi_mutex, NULL);
 
     syslog(LOG_INFO, "SPI %s, CS GPIO %i:%i", spidev, (int) cs_port, (int) cs_pin);
 

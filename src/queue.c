@@ -8,6 +8,7 @@
 
 #include <pthread.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
@@ -31,12 +32,18 @@ static pthread_mutex_t  mux;
 static uint16_t         queue_depth = 0;
 
 static bool             tx_enable = false;
-static uint64_t         tx_delay;
 static uint32_t         tx_header_timeout;
 static uint32_t         tx_data_timeout;
-static uint64_t         tx_disabled;
+static uint64_t         tx_disabled = UINT64_MAX;
 static uint64_t         tx_wait_timeout;
 static uint64_t         rssi_delay;
+
+// DIFS+CW state machine
+static bool             difs_passed = false;
+static uint64_t         difs_wait_start = 0;
+static bool             cw_passed = false;
+static uint64_t         cw_wait_start = 0;
+static uint32_t         cw_wait_target = 0;
 
 static bool send_packet() {
     bool res = false;
@@ -48,11 +55,8 @@ static bool send_packet() {
 
         pthread_mutex_unlock(&mux);
 
-        // Calculate airtime for this packet
-        uint32_t airtime = sx126x_air_time(item->len, NULL, NULL);
-        
         // Check if airtime locks allow transmission
-        if (!rnode_check_airtime_lock(airtime)) {
+        if (rnode_check_airtime_lock()) {
             syslog(LOG_INFO, "Airtime lock: deferring transmission");
             return false;  // Don't remove from queue, try again later
         }
@@ -60,9 +64,6 @@ static bool send_packet() {
         syslog(LOG_INFO, "Queue: pop to air (%i)", item->len);
         uint32_t actual_airtime = rnode_to_air(item->data, item->len);
         tx_wait_timeout = get_time() + actual_airtime * 2;
-        
-        // Update airtime usage after successful transmission
-        rnode_update_airtime_usage(actual_airtime);
 
         pthread_mutex_lock(&mux);
 
@@ -88,6 +89,14 @@ static bool send_packet() {
     return res;
 }
 
+static void csma_reset_state() {
+    difs_passed = false;
+    difs_wait_start = 0;
+    cw_passed = false;
+    cw_wait_start = 0;
+    cw_wait_target = 0;
+}
+
 static void * queue_worker(void *p) {
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
@@ -96,31 +105,57 @@ static void * queue_worker(void *p) {
         uint64_t now = get_time();
 
         if (sx126x_get_state() != SX126X_TX) {
-            if (tx_enable) {
-                if (now >= tx_delay) {
-                    uint32_t delay = csma_get_cw();
+            if (tx_enable && head != NULL) {
+                if (csma_medium_free()) {
+                    // DIFS wait
+                    if (!difs_passed) {
+                        if (difs_wait_start == 0) {
+                            difs_wait_start = now;
+                        } else if (now - difs_wait_start >= (uint64_t)csma_get_difs_ms()) {
+                            difs_passed = true;
+                            difs_wait_start = 0;
+                        }
+                    }
 
-                    send_packet();
-                    tx_delay = now + delay;
-                } else if (now > rssi_delay) {
-                    rssi_delay = now + 1000;
+                    // CW wait (only after DIFS passed)
+                    if (difs_passed && !cw_passed) {
+                        if (cw_wait_start == 0) {
+                            cw_wait_target = csma_get_cw();
+                            cw_wait_start = now;
+                        } else if (now - cw_wait_start >= cw_wait_target) {
+                            cw_passed = true;
+                        }
+                    }
 
-                    csma_update_current_rssi();
+                    // Transmit (after both DIFS and CW passed)
+                    if (difs_passed && cw_passed) {
+                        csma_reset_state();
+                        send_packet();
+                    }
+                } else {
+                    // Medium busy — reset CSMA state
+                    csma_reset_state();
                 }
-            } else {
+            } else if (!tx_enable) {
+                csma_reset_state();
+
                 if (now >= tx_disabled) {
-                    // TX was disabled (waiting for RX) but timed out
-                    // This can happen with false preamble detections or interference
-                    // Just re-enable TX instead of restarting the radio
-                    syslog(LOG_DEBUG, "TX disabled timeout - re-enabling (likely false preamble detection)");
+                    syslog(LOG_DEBUG, "False preamble timeout - re-enabling TX");
                     tx_enable = true;
-                    tx_delay = now + csma_get_cw();
+                    csma_set_dcd(false);
                 }
+            }
+
+            // Periodically update RSSI
+            if (now > rssi_delay) {
+                rssi_delay = now + 25;
+                csma_update_current_rssi();
             }
         } else if (now > tx_wait_timeout) {
             syslog(LOG_WARNING, "TX wait timeout! Radio restart");
             rnode_start();
         }
+
         usleep(1000);
     }
 }
@@ -175,22 +210,24 @@ void queue_medium_state(cause_medium_t cause) {
     switch(cause) {
         case CAUSE_INIT:
         case CAUSE_TX_DONE:
+            csma_set_dcd(false);
             tx_enable = true;
-            tx_delay = now;
             break;
 
         case CAUSE_RX_DONE:
         case CAUSE_HEADER_ERR:
+            csma_set_dcd(false);
             tx_enable = true;
-            tx_delay = now + csma_get_cw();
             break;
 
         case CAUSE_PREAMBLE_DETECTED:
+            csma_set_dcd(true);
             tx_enable = false;
             tx_disabled = now + tx_header_timeout;
             break;
 
         case CAUSE_HEADER_VALID:
+            csma_set_dcd(true);
             tx_enable = false;
             tx_disabled = now + tx_data_timeout;
             break;
