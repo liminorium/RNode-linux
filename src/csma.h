@@ -37,6 +37,7 @@ void csma_get_channel(csma_channel_t *out);
 
 void csma_set_dcd(bool carrier_detected);
 bool csma_medium_free();
+bool csma_should_flush();
 bool csma_get_interference();
 int32_t csma_get_difs_ms();
 

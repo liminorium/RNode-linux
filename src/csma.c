@@ -32,6 +32,8 @@
 #define LORA_PREAMBLE_TARGET_MS     24
 #define LORA_PREAMBLE_FAST_DELTA    18
 #define LORA_FAST_THRESHOLD_BPS     30000
+#define LORA_LIMIT_THRESHOLD_BPS    60000
+#define LORA_GUARD_THRESHOLD_BPS    14000
 
 #define AIRTIME_LONGTERM            3600
 #define AIRTIME_LONGTERM_MS         (AIRTIME_LONGTERM * 1000)
@@ -69,6 +71,9 @@ static float            lora_symbol_time_ms = 0.0;
 static float            lora_symbol_rate = 0.0;
 static long             lora_preamble_symbols = LORA_PREAMBLE_SYMBOLS_MIN;
 static long             lora_preamble_time_ms = 0;
+
+// Flush mode: at very low bitrates, send all queued packets after one DIFS+CW
+static bool             lora_should_flush = false;
 
 // DCD tracking
 static bool             dcd = false;
@@ -263,6 +268,10 @@ void csma_set_dcd(bool carrier_detected) {
     dcd = carrier_detected;
 }
 
+bool csma_should_flush() {
+    return lora_should_flush;
+}
+
 bool csma_medium_free() {
     if (avoid_interference && interference_detected) return false;
     return !dcd;
@@ -295,6 +304,10 @@ void csma_update_radio_params(uint8_t sf, uint32_t bw) {
 
     uint32_t lora_bitrate = (uint32_t)(sf * (4.0 / 5.0) / ((float)(1 << sf) / ((float)bw / 1000.0)) * 1000.0);
     bool fast_rate = lora_bitrate > LORA_FAST_THRESHOLD_BPS;
+
+    bool lora_limit_rate = lora_bitrate > LORA_LIMIT_THRESHOLD_BPS;
+    bool lora_guard_rate = !lora_limit_rate && lora_bitrate > LORA_GUARD_THRESHOLD_BPS;
+    lora_should_flush = !lora_limit_rate && !lora_guard_rate;
 
     int slot_min = CSMA_SLOT_MIN_MS;
     float preamble_target = LORA_PREAMBLE_TARGET_MS;

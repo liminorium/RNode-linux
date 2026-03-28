@@ -1029,6 +1029,12 @@ void sx126x_set_dio3_txco_ctrl(uint8_t voltage, uint16_t delay) {
     
     wait_on_busy();
     calibrate(0xFF);
+
+    // Keep TCXO running after TX/RX so back-to-back transmissions
+    // (e.g. split packets) don't stall waiting for TCXO warm-up.
+    wait_on_busy();
+    uint8_t fb[] = { 0x93, 0x40 };  // SetRxTxFallbackMode: STDBY_XOSC
+    write_bytes(fb, sizeof(fb));
 }
 
 void sx126x_set_freq(uint64_t x) {
@@ -1156,21 +1162,17 @@ void sx126x_write(const uint8_t *buf, uint8_t len) {
 
 void sx126x_end_packet() {
     state = SX126X_TX;
-    syslog(LOG_INFO, "Starting TX with %d bytes", payload_tx_rx);
+    syslog(LOG_INFO, "Starting TX with %d bytes", fifo_tx_addr_ptr);
 
     wait_on_busy();
-    set_packet_params_loRa(save_preamble_len, save_header_type, payload_tx_rx, save_crc);
+    set_packet_params_loRa(save_preamble_len, save_header_type, fifo_tx_addr_ptr, save_crc);
 
     set_irq_mask();
     switch_ant();
 
     wait_on_busy();
     set_tx(0);
-    
-    // Check if radio entered TX mode
-    usleep(1000);
-    uint8_t status = sx126x_get_status_mode() & 0x70;
-    syslog(LOG_INFO, "Radio status after SetTx: 0x%02X (expected 0x%02X for TX)", status, STATUS_MODE_TX);
+    wait_on_busy();
 }
 
 void sx126x_request(uint32_t timeout) {

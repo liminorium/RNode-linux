@@ -38,12 +38,16 @@ static uint64_t         tx_disabled = UINT64_MAX;
 static uint64_t         tx_wait_timeout;
 static uint64_t         rssi_delay;
 
-// DIFS+CW state machine
-static bool             difs_passed = false;
-static uint64_t         difs_wait_start = 0;
-static bool             cw_passed = false;
+// DIFS + CW listen-before-talk: matches reference firmware tx_queue_handler()
+// 1. DIFS wait: medium must stay free for difs_ms
+// 2. CW wait: medium must stay free for random contention window
+// If medium goes busy at any point, DIFS restarts but CW progress is preserved
+static uint64_t         medium_free_since = 0;
 static uint64_t         cw_wait_start = 0;
-static uint32_t         cw_wait_target = 0;
+static uint64_t         cw_wait_passed = 0;
+static uint64_t         cw_target = 0;
+static bool             cw_picked = false;
+static bool             flushing = false;
 
 static bool send_packet() {
     bool res = false;
@@ -89,14 +93,6 @@ static bool send_packet() {
     return res;
 }
 
-static void csma_reset_state() {
-    difs_passed = false;
-    difs_wait_start = 0;
-    cw_passed = false;
-    cw_wait_start = 0;
-    cw_wait_target = 0;
-}
-
 static void * queue_worker(void *p) {
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
@@ -106,39 +102,56 @@ static void * queue_worker(void *p) {
 
         if (sx126x_get_state() != SX126X_TX) {
             if (tx_enable && head != NULL) {
-                if (csma_medium_free()) {
-                    // DIFS wait
-                    if (!difs_passed) {
-                        if (difs_wait_start == 0) {
-                            difs_wait_start = now;
-                        } else if (now - difs_wait_start >= (uint64_t)csma_get_difs_ms()) {
-                            difs_passed = true;
-                            difs_wait_start = 0;
-                        }
-                    }
-
-                    // CW wait (only after DIFS passed)
-                    if (difs_passed && !cw_passed) {
-                        if (cw_wait_start == 0) {
-                            cw_wait_target = csma_get_cw();
-                            cw_wait_start = now;
-                        } else if (now - cw_wait_start >= cw_wait_target) {
-                            cw_passed = true;
-                        }
-                    }
-
-                    // Transmit (after both DIFS and CW passed)
-                    if (difs_passed && cw_passed) {
-                        csma_reset_state();
-                        send_packet();
+                if (flushing) {
+                    // Flush mode: send all queued packets back-to-back after one DIFS+CW
+                    if (!send_packet()) {
+                        flushing = false;
+                    } else if (head == NULL) {
+                        flushing = false;
                     }
                 } else {
-                    // Medium busy — reset CSMA state
-                    csma_reset_state();
+                    // Normal mode: DIFS+CW listen-before-talk
+                    // Pick CW target once per CSMA cycle
+                    if (!cw_picked) {
+                        cw_target = csma_get_cw();
+                        cw_picked = true;
+                    }
+
+                    if (csma_medium_free()) {
+                        if (medium_free_since == 0) {
+                            // Medium just became free, start DIFS timer
+                            medium_free_since = now;
+                        } else if (now - medium_free_since < (uint64_t)csma_get_difs_ms()) {
+                            // Still in DIFS wait, keep waiting
+                        } else {
+                            // DIFS passed, now in CW wait
+                            if (cw_wait_start == 0) {
+                                cw_wait_start = now;
+                            } else {
+                                cw_wait_passed += now - cw_wait_start;
+                                cw_wait_start = now;
+                            }
+
+                            if (cw_wait_passed >= cw_target) {
+                                // CW passed, transmit
+                                medium_free_since = 0;
+                                cw_wait_start = 0;
+                                cw_wait_passed = 0;
+                                cw_picked = false;
+
+                                if (csma_should_flush()) {
+                                    flushing = true;
+                                }
+                                send_packet();
+                            }
+                        }
+                    } else {
+                        // Medium busy: restart DIFS, pause CW (but preserve cw_wait_passed)
+                        medium_free_since = 0;
+                        cw_wait_start = 0;
+                    }
                 }
             } else if (!tx_enable) {
-                csma_reset_state();
-
                 if (now >= tx_disabled) {
                     syslog(LOG_DEBUG, "False preamble timeout - re-enabling TX");
                     tx_enable = true;
@@ -223,6 +236,7 @@ void queue_medium_state(cause_medium_t cause) {
         case CAUSE_PREAMBLE_DETECTED:
             csma_set_dcd(true);
             tx_enable = false;
+            flushing = false;
             tx_disabled = now + tx_header_timeout;
             break;
 
