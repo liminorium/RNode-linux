@@ -122,3 +122,7 @@ The repository includes an example configuration in [rnode.yaml](/home/sclark/de
 - This project is currently tailored to SX126x-based SPI modules.
 - The daemon binds to `0.0.0.0` on the configured TCP port.
 - The code links against `libm`, `libgpiod`, and `libcyaml`.
+
+## Development Disclaimer
+
+Some of the code in this repository was developed with assistance from a large language model (LLM). Any AI-assisted code or documentation should be treated as reviewed project material, but it may still contain mistakes or incomplete assumptions and should be validated before use in production or safety-critical environments.
